@@ -1,1 +1,0 @@
-# Deriv-digit-flow-anylisis-
