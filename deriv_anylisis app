@@ -1,0 +1,161 @@
+import streamlit as st, pandas as pd, numpy as np, matplotlib.pyplot as plt
+
+st.set_page_config(page_title="Deriv Digitflow — Risk-First Analyzer", layout="wide")
+st.title("Deriv Digitflow — Risk-First Analyzer")
+st.caption("Analytics & risk metrics. No trading advice. Use at your own risk.")
+
+# --- Sidebar controls ---
+with st.sidebar:
+    st.subheader("Inputs")
+    payout = st.number_input("Assumed payout (decimal, e.g. 1.90)", 1.01, 5.0, 1.90, 0.01)
+    conf_thr = st.slider("Min probability to take trade", 0.50, 1.00, 0.70, 0.01)
+    bankroll = st.number_input("Bankroll (simulation)", 10.0, 1_000_000.0, 1000.0, 10.0)
+    max_risk_pct = st.slider("Max stake per trade (%)", 0.1, 5.0, 1.0, 0.1)
+    kelly_cap = st.slider("Kelly cap (%)", 0.1, 10.0, 2.0, 0.1)
+    window_min = st.number_input("Min history before predicting", 50, 10000, 200, 10)
+    st.markdown("---")
+    st.write("Upload CSV with `timestamp,price` (we compute last digit).")
+
+file = st.file_uploader("Upload tick CSV (timestamp,price)", type=["csv"])
+
+# Demo if none
+if file is None:
+    st.info("No file uploaded — using demo random walk (not real market data).")
+    rng = np.random.default_rng(42)
+    n = 2000
+    prices = 100 + np.cumsum(rng.normal(0, 0.05, n))
+    df = pd.DataFrame({"timestamp": np.arange(n), "price": np.round(prices,2)})
+else:
+    df = pd.read_csv(file)
+
+if "price" not in df.columns:
+    st.error("Missing 'price' column."); st.stop()
+
+# --- Prepare digits ---
+def last_digit(p):
+    s = "".join(ch for ch in str(p) if ch.isdigit())
+    return int(s[-1]) if s else np.nan
+
+df = df.copy()
+df["digit"] = df["price"].apply(last_digit).astype("Int64")
+df = df.dropna(subset=["digit"]).reset_index(drop=True)
+
+st.write("Rows:", len(df))
+
+# --- Helper: build transition matrix from digits list ---
+def trans_probs(digs):
+    if len(digs) < 2: 
+        m = np.zeros((10,10))
+        return m, m
+    a, b = digs[:-1], digs[1:]
+    mat = pd.crosstab(pd.Series(a), pd.Series(b)).reindex(index=range(10), columns=range(10), fill_value=0)
+    row = mat.sum(axis=1).replace(0, np.nan)
+    prob = mat.div(row, axis=0).fillna(0.0)
+    return mat.values, prob.values
+
+# --- Walk-forward backtest (expanding window, no look-ahead) ---
+digits = df["digit"].astype(int).to_numpy()
+pred, pmax, taken, actual, evs, stakes, pnl = [], [], [], [], [], [], []
+bank = bankroll
+
+for t in range(1, len(digits)):
+    if t < window_min:
+        pred.append(np.nan); pmax.append(np.nan); taken.append(False)
+        actual.append(digits[t]); evs.append(0.0); stakes.append(0.0); pnl.append(0.0)
+        continue
+    # fit using data up to t-1
+    _, P = trans_probs(digits[:t])
+    cur = digits[t-1]
+    probs = P[cur] if 0 <= cur <= 9 else np.zeros(10)
+    best = int(np.argmax(probs)); p = float(probs[best])
+
+    # Expected value per $1 stake: win pays (payout-1), lose pays -1
+    ev = p*(payout-1) - (1-p)
+    # Kelly fraction for binary payoff with net odds b=(payout-1)
+    b = payout - 1.0
+    f_kelly = max(0.0, (b*p - (1-p)) / b) if b>0 else 0.0
+    f_kelly = min(f_kelly, kelly_cap/100.0)
+    stake_cap = bank * (max_risk_pct/100.0)
+    stake = min(bank * f_kelly, stake_cap)
+
+    do_trade = (p >= conf_thr) and (ev > 0) and (stake > 0)
+
+    win = int(digits[t] == best)
+    profit = (stake*(payout-1)) if win else (-stake)
+
+    # record
+    pred.append(best); pmax.append(p); taken.append(do_trade)
+    actual.append(digits[t]); evs.append(ev); stakes.append(stake if do_trade else 0.0)
+    pnl.append(profit if do_trade else 0.0)
+    bank += pnl[-1]
+
+res = pd.DataFrame({
+    "timestamp": df["timestamp"].iloc[1:].to_numpy(),
+    "actual": actual,
+    "pred": pred,
+    "p_max": pmax,
+    "trade": taken,
+    "stake": stakes,
+    "pnl": pnl,
+    "EV_per_$": evs
+})
+
+# --- Summary metrics ---
+n_all = res["pred"].notna().sum()
+n_trades = int(res["trade"].sum())
+acc_all = float((res["pred"]==res["actual"]).mean())
+if n_trades>0:
+    sel = res[res["trade"]]
+    hit = float((sel["pred"]==sel["actual"]).mean())
+    net = float(sel["pnl"].sum())
+else:
+    hit, net = np.nan, 0.0
+
+def max_drawdown(curve):
+    peak, dd = curve[0], 0.0
+    for x in curve:
+        peak = max(peak, x)
+        dd = max(dd, peak - x)
+    return dd
+
+equity = bankroll + res["pnl"].cumsum()
+dd = max_drawdown(equity.values) if len(equity)>0 else 0.0
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Rows used", f"{len(df):,}")
+c2.metric("Backtest accuracy (all ticks)", f"{acc_all*100:,.2f}%")
+c3.metric("Trades taken", f"{n_trades:,}")
+c4.metric("Hit rate (taken trades)", "N/A" if np.isnan(hit) else f"{hit*100:,.2f}%")
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Net P&L (sim)", f"{net:,.2f}")
+c2.metric("Max drawdown", f"{dd:,.2f}")
+c3.metric("Final equity", f"{(equity.iloc[-1] if len(equity)>0 else bankroll):,.2f}")
+c4.metric("Min EV threshold", f">{conf_thr:.2f}")
+
+st.caption("Walk-forward (expanding window) avoids look-ahead. Trades only when p≥threshold and EV>0. Stakes capped by Kelly and max risk %.")
+
+# --- Plots ---
+st.subheader("Digit distribution")
+counts = pd.Series(digits).value_counts().reindex(range(10), fill_value=0)
+fig1 = plt.figure(figsize=(6,3))
+plt.bar(counts.index, counts.values)
+plt.xlabel("Digit"); plt.ylabel("Count"); plt.tight_layout()
+st.pyplot(fig1)
+
+st.subheader("Transition probabilities (i→j)")
+_, Pfull = trans_probs(digits)
+fig2 = plt.figure(figsize=(5,5))
+plt.imshow(Pfull, aspect="auto"); plt.xticks(range(10)); plt.yticks(range(10)); plt.colorbar(); plt.tight_layout()
+st.pyplot(fig2)
+
+st.subheader("Equity curve (simulation)")
+fig3 = plt.figure(figsize=(8,3))
+plt.plot(equity.index, equity.values)
+plt.xlabel("Tick index"); plt.ylabel("Equity"); plt.tight_layout()
+st.pyplot(fig3)
+
+st.subheader("Trades log (last 200)")
+st.dataframe(res.tail(200), use_container_width=True)
+
+st.info("No system can guarantee 98%+ accuracy or avoid losses. This tool helps you measure **edge**, enforce **no-trade** when edge is weak, and cap risk.")
